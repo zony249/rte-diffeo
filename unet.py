@@ -15,6 +15,8 @@ from skimage.transform import resize
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 
+from homography import dv_loss
+
 random_seed = 1
 torch.backends.cudnn.enabled = True
 torch.manual_seed(random_seed)
@@ -107,8 +109,8 @@ class UNet(nn.Module):
   def __init__(self, in_channels=1, out_channels=1, time_emb_dim=64):
     super().__init__()
 
-    down_channels = (8, 16, 64, 512)
-    up_channels = (512, 64, 16, 8)
+    down_channels = (16, 32, 64, 256)
+    up_channels = (256, 64, 32, 16)
 
 
     # Time embedding
@@ -156,6 +158,17 @@ class PhiNet(nn.Module):
     super(PhiNet, self).__init__()
     self.net = UNet(input_channels,2).to(device)
 
+    self.encoder = nn.Sequential(
+        nn.Conv2d(in_channels=1, out_channels=16, kernel_size=1), 
+        nn.SiLU(), 
+        nn.Conv2d(in_channels=16, out_channels=16, kernel_size=1)
+    )
+  
+  def encode(self, I, J): 
+      Ie = self.encoder(I)
+      Je = self.encoder(J)
+      return Ie, Je
+
   def forward(self,I,J,xy0,t0,t):
     uin = torch.cat((I,J),dim=1)
     phi = xy0 + (t-t0)*self.net(uin,torch.cat((t0,t))).permute(0,2,3,1)
@@ -196,7 +209,7 @@ class PhiNet(nn.Module):
     if mask is not None: 
       image_loss = torch.where(maskw_level, (Iw_level - Jw_level)**2, 0).sum() / (maskw_level.sum() * Iw.shape[1])
     else:
-      image_loss = F.mse_loss(Jw_level,Iw_level) 
+      image_loss = dv_loss(Jw_level,Iw_level, encode_function=self.encode) 
 
     phiI_ = self(I, J, xy, t, t-1) 
     phiI_ = F.grid_sample(phiI_.permute(0, 3, 1, 2), phiJ, padding_mode="reflection", align_corners=True).permute(0, 2, 3, 1)

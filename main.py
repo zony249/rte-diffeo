@@ -21,9 +21,14 @@ from skimage.transform import resize
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 from torch.utils.data import Dataset, DataLoader
+from array import array 
+import struct
+import shutil
 
 from unet import SinusoidalPositionEmbeddings, UNet, PhiNet
 from runet import RPhiNet
+from unet_multi import PhiNetMultiLevel
+from runet_multi import RPhiNetMultiLevel
 from homography import Trainer, Homography, mse, dv_loss, histogram_mutual_information
 
 
@@ -127,45 +132,148 @@ class FIREDataset(Dataset):
         return len(self.img1_ids)
 
 
-def get_dataloader() -> DataLoader:
+class Knee(Dataset): 
+    def __init__(self, dir_path="./"): 
+        super().__init__()
+        k1_path = os.path.join(dir_path, "knee1.bmp")
+        k2_path = os.path.join(dir_path, "knee2.bmp")
+        self.knee1 = io.imread(k1_path).astype(np.float32) / 255.0
+        self.knee2 = io.imread(k2_path).astype(np.float32) / 255.0
 
-    # The dataset should output I, J, xy_
-    pass 
+        if len(self.knee1.shape) == 2:
+            self.knee1 = self.knee1[None, ...]
+        if len(self.knee2.shape) == 2:
+            self.knee2 = self.knee2[None, ...]
+
+        self.mask = None
+
+    def __len__(self): 
+        return 1
+
+    def __getitem__(self, idx): 
+
+        h, w = 512, 512
+
+        I_t = torch.from_numpy(self.knee1).unsqueeze(0).to(DEVICE)
+        J_t = torch.from_numpy(self.knee2).unsqueeze(0).to(DEVICE)
+
+        x = torch.linspace(-1, 1, w).to(DEVICE)
+        y = torch.linspace(-1, 1, h).to(DEVICE)
+        xy = torch.meshgrid(x, y, indexing="xy")
+        xy = torch.stack(xy, dim=2).unsqueeze(0)
+
+        I_t = F.grid_sample(I_t, xy, mode="bilinear", padding_mode="reflection", align_corners=False)
+        J_t = F.grid_sample(J_t, xy, mode="bilinear", padding_mode="reflection", align_corners=False)
+
+        return I_t, J_t, xy, None
 
 
 
-def train(dataset):
+class MNIST(Dataset): 
+    def __init__(self, data_path="MNIST"): 
+        super().__init__() 
+
+        self.test_images_filepath = os.path.join(data_path, "t10k-images.idx3-ubyte") 
+        self.test_labels_filepath = os.path.join(data_path, "t10k-labels.idx1-ubyte") 
+
+        self.images, self.labels = self.read_images_labels(self.test_images_filepath, self.test_labels_filepath)
+
+        self.labels = np.array(self.labels)
+        self.images = np.array(self.images)
+
+
+        self.images1 = [3, 2, 1, 18, 4, 23, 11, 0, 61, 12]
+        self.images2 = [10, 5, 35, 30, 6, 15, 21, 17, 84, 9] 
+        self.mask = None
+    
+    def read_images_labels(self, images_filepath, labels_filepath):       
+        """
+        taken from https://www.kaggle.com/code/hojjatk/read-mnist-dataset
+        """ 
+        labels = []
+        with open(labels_filepath, 'rb') as file:
+            magic, size = struct.unpack(">II", file.read(8))
+            if magic != 2049:
+                raise ValueError('Magic number mismatch, expected 2049, got {}'.format(magic))
+            labels = array("B", file.read())        
+        
+        with open(images_filepath, 'rb') as file:
+            magic, size, rows, cols = struct.unpack(">IIII", file.read(16))
+            if magic != 2051:
+                raise ValueError('Magic number mismatch, expected 2051, got {}'.format(magic))
+            image_data = array("B", file.read())        
+        images = []
+        for i in range(size):
+            images.append([0] * rows * cols)
+        for i in range(size):
+            img = np.array(image_data[i * rows * cols:(i + 1) * rows * cols])
+            img = img.reshape(28, 28)
+            images[i][:] = img            
+        
+        return images, labels
+            
+    def __len__(self): 
+        return len(self.images1) 
+
+    def __getitem__(self, idx): 
+        
+        image1 = self.images[self.images1[idx]]
+        image2 = self.images[self.images2[idx]]
+
+        image1 = np.pad(image1, [(2,2), (2, 2)])
+        image2 = np.pad(image2, [(2,2), (2, 2)])
+
+        h, w = image1.shape        
+
+        x = torch.linspace(-1, 1, w).to(DEVICE)
+        y = torch.linspace(-1, 1, h).to(DEVICE)
+        xy = torch.meshgrid(x, y, indexing="xy")
+        xy = torch.stack(xy, dim=2).unsqueeze(0)
+
+        I_t = torch.from_numpy(image1).unsqueeze(0).unsqueeze(0).to(DEVICE) / 255.0
+        J_t = torch.from_numpy(image2).unsqueeze(0).unsqueeze(0).to(DEVICE) / 255.0
+
+        return I_t, J_t, xy, None
+
+
+
+
+
+def train(dataset, output, hparams=None):
+
+
+    if os.path.isdir(output): 
+        shutil.rmtree(output)
+
+    grids_path = os.path.join(output, "grids")
+    flow_vec_path = os.path.join(output, "flow_vec")
+    diff_path = os.path.join(output, "diff")
+    results_path = os.path.join(output, "results")
+
+    os.makedirs(grids_path)
+    os.makedirs(flow_vec_path)
+    os.makedirs(diff_path)
+    os.makedirs(results_path)
+
 
     learning_rate = 1e-3
 
     for i, item in enumerate(dataset):
-        if i < 2: 
+        if i < 5: 
             continue
 
-        network = RPhiNet(input_channels=6).to(DEVICE)
+        network = PhiNet(input_channels=2).to(DEVICE)
         optimizer = optim.Adam(network.parameters(), lr=learning_rate)
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
-        optimizer1 = optim.Adam(network.parameters(), lr=0.01)
+        optimizer1 = optim.Adam(network.parameters(), lr=0.001)
         scaler = torch.amp.GradScaler()
         torch.cuda.empty_cache()
 
         I, J, xy, points = item
 
+        h, w = I.shape[-2:]
+
         mask = dataset.mask
-
-
-        pre_align = Homography() 
-        trainer = Trainer(pre_align, 
-                          lr=1e-3, 
-                          levels=4, 
-                          steps_per_epoch=100, 
-                          loss_fn=dv_loss)
-
-        trainer.register(I, J)
-        pre_align = trainer.Hnet
-
-        with torch.no_grad(): 
-            J_pre, H = pre_align(J)
 
 
         # identity loss
@@ -174,8 +282,8 @@ def train(dataset):
             optimizer1.zero_grad()
             with torch.amp.autocast(DEVICE.type, dtype=torch.bfloat16):
                 t = torch.rand(1).to(DEVICE)
-                xyf = network(I,J_pre,xy,t0,t)
-                xyr = network(I,J_pre,xy,t0,-t)
+                xyf = network(I,J,xy,t0,t)
+                xyr = network(I,J,xy,t0,-t)
                 loss = torch.mean((xyf-xy)**2)+torch.mean((xyr-xy)**2)
             loss.backward()
             optimizer1.step()
@@ -194,8 +302,8 @@ def train(dataset):
         print("")
         # coarse to fine multi resolution optimization
         L = 10
-        lam=1e1
-        nEpoch = 40
+        lam=hparams["lam"]
+        nEpoch = 100
         batchsize = 1
         for epoch in range(nEpoch):
 
@@ -204,7 +312,7 @@ def train(dataset):
             for level in range(L):
                 optimizer.zero_grad()
                 for step in range(batchsize):
-                    loss,ss_loss = network.loss(I,J_pre,xy,res[level])
+                    loss,ss_loss = network.loss(I,J,xy,res[level])
                     total_loss = loss+lam*ss_loss
                     total_loss.backward()
                 optimizer.step()
@@ -221,7 +329,7 @@ def train(dataset):
             scheduler.step()
 
         for level in range(L):
-            loss,ss_loss = network.loss(I,J_pre,xy,res[level])
+            loss,ss_loss = network.loss(I,J,xy,res[level])
             total_loss = loss+lam*ss_loss
             print("Resolution:",L-1-level,"Epoch:",nEpoch,"Total loss:","{:.6f}".format(total_loss.item()),
                                 "image loss:","{:.6f}".format(loss.item()),
@@ -231,26 +339,23 @@ def train(dataset):
 
         # TEST 
 
-        J_pre, H = pre_align(J) 
-        xy_flattened = xy.reshape(-1, 2)
-        xy_pre = (H @ torch.cat([xy_flattened, torch.ones_like(xy_flattened[:, -1:])], dim=1).T).T
-        xy_pre = xy_pre[:, :2].reshape(1, xy.shape[1], xy.shape[2], 2)
 
 
-        xyd = network(I,J_pre,xy,torch.zeros(1).to(DEVICE),1.0*torch.ones(1).to(DEVICE))
 
-        xyd_r = network(I,J_pre,xy,torch.zeros(1).to(DEVICE),-1.0*torch.ones(1).to(DEVICE))
+        xyd = network(I,J ,xy,torch.zeros(1).to(DEVICE),1.0*torch.ones(1).to(DEVICE))
 
-        Jw = F.grid_sample(J_pre,xyd,padding_mode='reflection',align_corners=True)
+        xyd_r = network(I,J ,xy,torch.zeros(1).to(DEVICE),-1.0*torch.ones(1).to(DEVICE))
+
+        Jw = F.grid_sample(J,xyd,padding_mode='reflection',align_corners=True)
         Iw = F.grid_sample(I,xyd_r,padding_mode='reflection',align_corners=True)
 
 
         r1 = (J-I).max() - (J-I).min()
-        r2 = (J_pre-I).max() - (J_pre-I).min()
+        r2 = (J-I).max() - (J-I).min()
         r3 = (Jw-I).max() - (Jw-I).min()
 
         m1 = (J-I).min()
-        m2 = (J_pre-I).min()
+        m2 = (J-I).min()
         m3 =  (Jw-I).min()
         
         max_range = torch.max(torch.tensor([r1, r2, r3])).detach().cpu().item() 
@@ -258,57 +363,91 @@ def train(dataset):
 
         imgI = I[0].permute(1, 2, 0).detach().cpu().numpy() 
         imgJ = J[0].permute(1, 2, 0).detach().cpu().numpy() 
-        imgJ_pre = J_pre[0].permute(1, 2, 0).detach().cpu().numpy() 
         imgJw = Jw[0].permute(1, 2, 0).detach().cpu().numpy() 
 
         mi_I_J = histogram_mutual_information(imgI, imgJ)
-        mi_I_J_pre = histogram_mutual_information(imgI, imgJ_pre)
         mi_I_Jw = histogram_mutual_information(imgI, imgJw)
 
 
-        fig=plt.figure(figsize=(16,4))
+        fig=plt.figure(figsize=(10,4))
 
-        fig.add_subplot(1,3,1)
+        fig.add_subplot(1,2,1)
         plt.title(f"J-I before Reg. MI: {mi_I_J:.5f}")
-        plt.imshow((((J-I) - min_val)/max_range).squeeze().cpu().permute(1, 2, 0).data)
+        plt.imshow((((J-I) - min_val)/max_range).squeeze(0).cpu().permute(1, 2, 0).data)
 
-        fig.add_subplot(1,3,2)
-        plt.imshow((((J_pre-I) - min_val)/max_range).squeeze().cpu().permute(1, 2, 0).data)
-        plt.title(f"J_pre-I after Reg. MI: {mi_I_J_pre:.5f}")
-
-
-        fig.add_subplot(1,3,3)
-        plt.imshow((((Jw-I) - min_val)/max_range).squeeze().cpu().permute(1, 2, 0).data)
-        plt.title(f"Jw-I after Reg. MI: {mi_I_Jw:.5f}")
+        fig.add_subplot(1,2,2)
+        plt.imshow((((Jw-I) - min_val)/max_range).squeeze(0).cpu().permute(1, 2, 0).data)
+        plt.title(f"J_deformed-I after Reg. MI: {mi_I_Jw:.5f}")
+        plt.savefig(os.path.join(diff_path, f"{i}.png"), dpi=300)
 
 
-        plt.savefig(f"registration_results.png", dpi=300)
-
+        k = hparams["k"]
         fig=plt.figure(figsize=(5,5))
         d_ = (xyd - xy).squeeze()
         #fig=plt.figure(figsize=(5,5))
         fig.add_subplot(1,1,1)
-        plt.quiver(d_.cpu().data[::5,::5,0], d_.cpu().data[::5,::5,1],color='r')
+        plt.quiver(d_.cpu().data[::k,::k,0], d_.cpu().data[::k,::k,1],color='r')
         plt.axis('equal')
         plt.title("Forward")
 
-        # d__ = (xyd_r - xy_).squeeze()
-        # #fig=plt.figure(figsize=(5,5))
-        # fig.add_subplot(1,2,2)
-        # plt.quiver(d__.cpu().data[::2,::2,0], d__.cpu().data[::2,::2,1],color='r')
-        # plt.axis('equal')
-        # plt.title("Reverse")
-        # plt.show()
+        plt.savefig(os.path.join(flow_vec_path, f"{i}.png"), dpi=300)
 
-        plt.savefig("flow_vectors.png", dpi=300)
 
+
+        fig=plt.figure(figsize=(14,4))
+
+        fig.add_subplot(1,3,1)
+        plt.title(f"I")
+        plt.imshow(I.squeeze(0).cpu().permute(1, 2, 0).data)
+
+        fig.add_subplot(1,3,2)
+        plt.title(f"J")
+        plt.imshow(J.squeeze(0).cpu().permute(1, 2, 0).data)
+
+        fig.add_subplot(1,3,3)
+        plt.imshow(Jw.squeeze(0).cpu().permute(1, 2, 0).data)
+        plt.title(f"J_deformed")
+
+        plt.savefig(os.path.join(results_path, f"{i}.png"), dpi=300)
+
+
+        def plot_grid(x,y, ax=None, **kwargs):
+            ax = ax or plt.gca()
+            segs1 = np.stack((x,y), axis=2)
+            segs2 = segs1.transpose(1,0,2)
+            ax.add_collection(LineCollection(segs1, **kwargs))
+            ax.add_collection(LineCollection(segs2, **kwargs))
+            ax.autoscale()
+
+        down_factor = hparams["down_factor"]
+        h_resize = int(down_factor*h)
+        w_resize = int(down_factor*w)
+
+        grid_x = resize(xy.cpu()[:,:,:,0].squeeze().numpy(),(h_resize,w_resize))
+        grid_y = resize(xy.cpu()[:,:,:,1].squeeze().numpy(),(h_resize,w_resize))
+        distx = resize(xyd.cpu()[:,:,:,0].squeeze().detach().numpy(),(h_resize,w_resize))
+        disty = resize(xyd.cpu()[:,:,:,1].squeeze().detach().numpy(),(h_resize,w_resize))
+
+        fig, (ax1,ax2) = plt.subplots(1,2,figsize=(10, 4))
+        plot_grid(grid_x,grid_y, ax=ax1,  color="lightgrey", linewidths=0.5)
+        plot_grid(distx, disty, ax=ax1, color="C0", linewidths=0.5)
+
+        plt.savefig(os.path.join(grids_path, f"{i}.png"), dpi=300)
 
         break
+
 
 if __name__ == "__main__":
 
 
     dataset = FIREDataset("FIRE")
+    dataset = Knee()
+    # dataset = MNIST()
 
+    hparams_knee = {
+        "k": 15, 
+        "down_factor": 0.15, 
+        "lam": 5e2, 
+    }
 
-    train(dataset)
+    train(dataset, "OUTPUT_baseline", hparams_knee)

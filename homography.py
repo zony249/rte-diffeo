@@ -49,13 +49,17 @@ class Tnet(nn.Module):
 class Homography(nn.Module): 
     def __init__(self, input_channels_per_image=3, features=32): 
         super().__init__()  
-        self.basis = torch.zeros((4, 3, 3), device=DEVICE)
+        self.basis = torch.zeros((8, 3, 3), device=DEVICE)
         self.basis[0,0,2] = 1. 
         self.basis[1,1,2] = 1. 
-        self.basis[2,0,0], self.basis[2,1,1] = 1., 1. 
-        self.basis[3,1,0], self.basis[3,0,1] = 1., -1.
+        self.basis[2,0,1] = 1. 
+        self.basis[3,1,0] = 1.
+        self.basis[4,0,0], self.basis[4,1,1] = 1., -1. 
+        self.basis[5,1,1], self.basis[5,2,2] = -1., 1.
+        self.basis[6,2,0] = 1. 
+        self.basis[7,2,1] = 1. 
 
-        self.v = nn.Parameter(torch.ones((4,1,1), device=DEVICE)*0, requires_grad=True) 
+        self.v = nn.Parameter(torch.zeros((8,1,1), device=DEVICE), requires_grad=True) 
 
         self.features = features
         self.encode = Tnet(in_channels=input_channels_per_image, features=features).to(DEVICE)
@@ -87,7 +91,7 @@ class Homography(nn.Module):
         A = torch.eye(3, device=DEVICE)
         n_fact = 1
         H = torch.eye(3, device=DEVICE)
-        for i in range(11): 
+        for i in range(20): 
             A = (v * B).sum(dim=0) @ A
             n_fact = max(i, 1) * n_fact
             A /= n_fact
