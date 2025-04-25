@@ -26,9 +26,6 @@ import struct
 import shutil
 
 from unet import SinusoidalPositionEmbeddings, UNet, PhiNet
-from runet import RPhiNet
-from unet_multi import PhiNetMultiLevel
-from runet_multi import RPhiNetMultiLevel
 from homography import Trainer, Homography, mse, dv_loss, histogram_mutual_information
 
 
@@ -60,76 +57,6 @@ xy_ = torch.tensor(np.stack([x_,y_],2),dtype=torch.float32).unsqueeze(0).to(DEVI
 
 print(h_, w_)
 
-
-class FIREDataset(Dataset): 
-
-    def __init__(self, fire_dir): 
-        super().__init__() 
-        self.dir = fire_dir 
-        self.img1_paths = sorted(glob(os.path.join(fire_dir, "Images", "*_1.jpg")))
-        self.img2_paths = sorted(glob(os.path.join(fire_dir, "Images", "*_2.jpg")))
-
-        self.img1_ids = [x.split("/")[-1].split("_")[0] for x in self.img1_paths]
-        self.img2_ids = [x.split("/")[-1].split("_")[0] for x in self.img2_paths]
-
-        self.ground_truth_base_path = os.path.join(fire_dir, "Ground Truth")
-        self.mask_path = os.path.join(fire_dir, "Masks", "mask.png")
-
-        self.mask = io.imread(self.mask_path).astype(np.float32) / 255. 
-        self.mask = torch.from_numpy(self.mask)[None, None, ...].to(DEVICE)
-
-    def get_ground_truth_path(self, name:str) -> np.ndarray: 
-        return os.path.join(self.ground_truth_base_path, f"control_points_{name}_1_2.txt")
-    
-    def get_gt_points(self, name:str) -> Tuple[np.ndarray, np.ndarray]: 
-        gt_path = self.get_ground_truth_path(name) 
-
-        with open(gt_path, "r") as f: 
-            lines = f.readlines()
-
-        data = np.array([l.split(" ") for l in lines]) 
-
-        # first two columns is gt, the other two are starting points
-        gt = data[:, :2]
-        start = data[:, 2:]
-        return gt, start
-
-    def __getitem__(self, idx:int) -> Tuple[torch.Tensor, 
-                                            torch.Tensor, 
-                                            torch.Tensor, 
-                                            Tuple[np.ndarray, np.ndarray]]: 
-        img_id = self.img1_ids[idx]
-        assert img_id == self.img2_ids[idx] 
-
-        img1_path = self.img1_paths[idx]
-        img2_path = self.img2_paths[idx] 
-
-        I = io.imread(img1_path).astype(np.float32) / 255.0 
-        J = io.imread(img2_path).astype(np.float32) / 255.0 
-
-        h, w = 512, 512
-
-        I_t = torch.from_numpy(I).permute(2, 0, 1).unsqueeze(0).to(DEVICE)
-        J_t = torch.from_numpy(J).permute(2, 0, 1).unsqueeze(0).to(DEVICE)
-
-
-        x = torch.linspace(-1, 1, w).to(DEVICE)
-        y = torch.linspace(-1, 1, h).to(DEVICE)
-        xy = torch.meshgrid(x, y, indexing="xy")
-        xy = torch.stack(xy, dim=2).unsqueeze(0)
-
-        I_t = F.grid_sample(I_t, xy, mode="bilinear", padding_mode="reflection", align_corners=False)
-        J_t = F.grid_sample(J_t, xy, mode="bilinear", padding_mode="reflection", align_corners=False)
-
-
-        gt, starting = self.get_gt_points(img_id) 
-
-        return I_t, J_t, xy, (gt, starting)
-
-
-
-    def __len__(self): 
-        return len(self.img1_ids)
 
 
 class Knee(Dataset): 
@@ -249,11 +176,15 @@ def train(dataset, output, hparams=None):
     flow_vec_path = os.path.join(output, "flow_vec")
     diff_path = os.path.join(output, "diff")
     results_path = os.path.join(output, "results")
+    orig_path = os.path.join(output, "orig")
+    samples_path = os.path.join(output, "samples")
 
     os.makedirs(grids_path)
     os.makedirs(flow_vec_path)
     os.makedirs(diff_path)
     os.makedirs(results_path)
+    os.makedirs(orig_path)
+    os.makedirs(samples_path)
 
 
     learning_rate = 1e-3
@@ -434,13 +365,27 @@ def train(dataset, output, hparams=None):
 
         plt.savefig(os.path.join(grids_path, f"{i}.png"), dpi=300)
 
+
+        for k, v in {"I":I, "J":J}.items(): 
+
+            fig = plt.figure(figsize=(8, 8)) 
+            fig.add_subplot(1,1,1)
+            plt.title(k)
+            plt.imshow(v.squeeze(0).cpu().permute(1, 2, 0).data)
+            plt.savefig(os.path.join(orig_path, f"{k}_{i:03d}.png"), dpi=300)
+
+        fig = plt.figure(figsize=(8, 8)) 
+        fig.add_subplot(1,1,1)
+        plt.title("J_deformed")
+        plt.imshow(Jw.squeeze(0).cpu().permute(1, 2, 0).data)
+        plt.savefig(os.path.join(samples_path, f"Jw_{i:03d}.png"), dpi=300) 
+
         break
 
 
 if __name__ == "__main__":
 
 
-    dataset = FIREDataset("FIRE")
     dataset = Knee()
     # dataset = MNIST()
 
